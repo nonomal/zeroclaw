@@ -2,7 +2,7 @@
 
 This page defines the fastest supported path to install and initialize ZeroClaw.
 
-Last verified: **February 20, 2026**.
+Last verified: **March 5, 2026**.
 
 ## Option 0: Homebrew (macOS/Linuxbrew)
 
@@ -16,6 +16,14 @@ brew install zeroclaw
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 ./bootstrap.sh
+```
+
+Windows PowerShell equivalent:
+
+```powershell
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+.\bootstrap.ps1
 ```
 
 What it does by default:
@@ -65,6 +73,7 @@ Notes:
 - `--prefer-prebuilt` tries release binary download first, then falls back to source build.
 - `--prebuilt-only` disables source fallback.
 - `--force-source-build` disables pre-built flow entirely.
+- On Windows, use `bootstrap.ps1` (`-InstallRust`, `-PreferPrebuilt`, `-PrebuiltOnly`, `-ForceSourceBuild`).
 
 ## Option B: Remote one-liner
 
@@ -110,6 +119,7 @@ it pulls `ghcr.io/zeroclaw-labs/zeroclaw:latest` and tags it locally before runn
 
 ```bash
 ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter
+./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter --model "openrouter/auto"
 ```
 
 Or with environment variables:

@@ -11,6 +11,7 @@ pub mod api;
 mod openai_compat;
 pub mod sse;
 pub mod static_files;
+mod webhook_ingress;
 pub mod ws;
 
 use crate::channels::{
@@ -610,6 +611,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    println!("  POST /agent     — tool-enabled agent chat {{\"message\": \"your prompt\"}}");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
@@ -718,6 +720,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
+        .route("/agent", post(handle_agent))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -736,6 +739,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cron", post(api::handle_api_cron_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
         .route("/api/integrations", get(api::handle_api_integrations))
+        .route(
+            "/api/integrations/settings",
+            get(api::handle_api_integrations_settings),
+        )
+        .route(
+            "/api/integrations/{id}/credentials",
+            put(api::handle_api_integration_credentials_put),
+        )
         .route(
             "/api/doctor",
             get(api::handle_api_doctor).post(api::handle_api_doctor),
@@ -974,6 +985,12 @@ pub struct WebhookBody {
     pub message: String,
 }
 
+/// Agent request body
+#[derive(serde::Deserialize)]
+pub struct AgentBody {
+    pub message: String,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct NodeControlRequest {
     pub method: String,
@@ -1157,39 +1174,27 @@ async fn handle_node_control(
     }
 }
 
-/// POST /webhook — main webhook endpoint
-async fn handle_webhook(
+/// POST /agent — authenticated single-turn agent endpoint with tool execution.
+///
+/// This compatibility route mirrors CLI-style agent behavior for callers that
+/// expect a JSON POST API rather than WebSocket chat.
+async fn handle_agent(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<AgentBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
-        tracing::warn!("/webhook rate limit exceeded");
+        tracing::warn!("/agent rate limit exceeded");
         let err = serde_json::json!({
-            "error": "Too many webhook requests. Please retry later.",
+            "error": "Too many agent requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
         });
         return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
 
-    // Require at least one auth layer for non-loopback traffic.
-    if !state.pairing.require_pairing()
-        && state.webhook_secret_hash.is_none()
-        && !peer_addr.ip().is_loopback()
-    {
-        tracing::warn!(
-            "Webhook: rejected unauthenticated non-loopback request (pairing disabled and no webhook secret configured)"
-        );
-        let err = serde_json::json!({
-            "error": "Unauthorized — configure pairing or X-Webhook-Secret for non-local webhook access"
-        });
-        return (StatusCode::UNAUTHORIZED, Json(err));
-    }
-
-    // ── Bearer token auth (pairing) ──
     if state.pairing.require_pairing() {
         let auth = headers
             .get(header::AUTHORIZATION)
@@ -1197,7 +1202,6 @@ async fn handle_webhook(
             .unwrap_or("");
         let token = auth.strip_prefix("Bearer ").unwrap_or("");
         if !state.pairing.is_authenticated(token) {
-            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
             });
@@ -1205,29 +1209,10 @@ async fn handle_webhook(
         }
     }
 
-    // ── Webhook secret auth (optional, additional layer) ──
-    if let Some(ref secret_hash) = state.webhook_secret_hash {
-        let header_hash = headers
-            .get("X-Webhook-Secret")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(hash_webhook_secret);
-        match header_hash {
-            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
-            _ => {
-                tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Secret");
-                let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
-            }
-        }
-    }
-
-    // ── Parse body ──
-    let Json(webhook_body) = match body {
+    let Json(agent_body) = match body {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!("Webhook JSON parse error: {e}");
+            tracing::warn!("/agent JSON parse error: {e}");
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
@@ -1235,25 +1220,13 @@ async fn handle_webhook(
         }
     };
 
-    // ── Idempotency (optional) ──
-    if let Some(idempotency_key) = headers
-        .get("X-Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if !state.idempotency_store.record_if_new(idempotency_key) {
-            tracing::info!("Webhook duplicate ignored (idempotency key: {idempotency_key})");
-            let body = serde_json::json!({
-                "status": "duplicate",
-                "idempotent": true,
-                "message": "Request already processed for this idempotency key"
-            });
-            return (StatusCode::OK, Json(body));
-        }
+    let message = agent_body.message.trim();
+    if message.is_empty() {
+        let err = serde_json::json!({
+            "error": "message must not be empty"
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
     }
-
-    let message = &webhook_body.message;
 
     if state.auto_save {
         let key = webhook_memory_key();
@@ -1286,77 +1259,72 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, message).await {
+    let response = match run_gateway_chat_with_tools(&state, message).await {
         Ok(response) => {
-            let safe_response =
-                sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
-            let duration = started_at.elapsed();
+            let safe = sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::LlmResponse {
                     provider: provider_label.clone(),
                     model: model_label.clone(),
-                    duration,
+                    duration: started_at.elapsed(),
                     success: true,
                     error_message: None,
                     input_tokens: None,
                     output_tokens: None,
                 });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
             state
                 .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
-
-            let body = serde_json::json!({"response": safe_response, "model": state.model});
-            (StatusCode::OK, Json(body))
+                .record_event(&crate::observability::ObserverEvent::TurnComplete);
+            safe
         }
         Err(e) => {
-            let duration = started_at.elapsed();
-            let sanitized = providers::sanitize_api_error(&e.to_string());
-
+            let sanitized = crate::providers::sanitize_api_error(&e.to_string());
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::LlmResponse {
                     provider: provider_label.clone(),
                     model: model_label.clone(),
-                    duration,
+                    duration: started_at.elapsed(),
                     success: false,
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
                 });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::Error {
-                    component: "gateway".to_string(),
-                    message: sanitized.clone(),
-                });
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
 
-            tracing::error!("Webhook provider error: {}", sanitized);
-            let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            let err = serde_json::json!({
+                "error": format!("Provider error: {sanitized}")
+            });
+            return (StatusCode::BAD_GATEWAY, Json(err));
         }
-    }
+    };
+
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentEnd {
+            provider: provider_label,
+            model: model_label,
+            duration: started_at.elapsed(),
+            tokens_used: None,
+            cost_usd: None,
+        });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "response": response
+        })),
+    )
+}
+
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    webhook_ingress::handle_webhook_inner(state, peer_addr, headers, body).await
 }
 
 /// `WhatsApp` verification query params
@@ -1972,6 +1940,18 @@ mod tests {
 
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn agent_body_requires_message_field() {
+        let valid = r#"{"message": "hello"}"#;
+        let parsed: Result<AgentBody, _> = serde_json::from_str(valid);
+        assert!(parsed.is_ok());
+        assert_eq!(parsed.unwrap().message, "hello");
+
+        let missing = r#"{"other": "field"}"#;
+        let parsed: Result<AgentBody, _> = serde_json::from_str(missing);
         assert!(parsed.is_err());
     }
 
@@ -2677,6 +2657,56 @@ Reminder set successfully."#;
     }
 
     #[tokio::test]
+    async fn agent_endpoint_requires_bearer_token_when_pairing_enabled() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl;
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let paired_token = "zc_test_token".to_string();
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(true, std::slice::from_ref(&paired_token))),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let unauthorized = handle_agent(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(AgentBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn webhook_rejects_public_traffic_without_auth_layers() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl;
@@ -3129,11 +3159,11 @@ Reminder set successfully."#;
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
-        let response = handle_nextcloud_talk_webhook(
+        let response = Box::pin(handle_nextcloud_talk_webhook(
             State(state),
             HeaderMap::new(),
             Bytes::from_static(br#"{"type":"message"}"#),
-        )
+        ))
         .await
         .into_response();
 
@@ -3198,9 +3228,13 @@ Reminder set successfully."#;
             HeaderValue::from_str(invalid_signature).unwrap(),
         );
 
-        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
-            .await
-            .into_response();
+        let response = Box::pin(handle_nextcloud_talk_webhook(
+            State(state),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
@@ -3240,11 +3274,11 @@ Reminder set successfully."#;
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
-        let response = handle_qq_webhook(
+        let response = Box::pin(handle_qq_webhook(
             State(state),
             HeaderMap::new(),
             Bytes::from_static(br#"{"op":13,"d":{"plain_token":"p","event_ts":"1"}}"#),
-        )
+        ))
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -3294,13 +3328,13 @@ Reminder set successfully."#;
         let mut headers = HeaderMap::new();
         headers.insert("X-Bot-Appid", HeaderValue::from_static("11111111"));
 
-        let response = handle_qq_webhook(
+        let response = Box::pin(handle_qq_webhook(
             State(state),
             headers,
             Bytes::from_static(
                 br#"{"op":13,"d":{"plain_token":"Arq0D5A61EgUu4OxUvOp","event_ts":"1725442341"}}"#,
             ),
-        )
+        ))
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);

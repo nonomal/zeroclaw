@@ -20,6 +20,7 @@ pub mod anthropic;
 pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
+pub mod error_parser;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
@@ -74,6 +75,7 @@ const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+const LITELLM_BASE_URL: &str = "http://localhost:4000/v1";
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
@@ -876,6 +878,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
+        "litellm" | "lite-llm" => vec!["LITELLM_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
         "telnyx" => vec!["TELNYX_API_KEY"],
         _ => vec![],
@@ -1000,6 +1003,20 @@ pub fn create_provider_with_url(
     api_url: Option<&str>,
 ) -> anyhow::Result<Box<dyn Provider>> {
     create_provider_with_url_and_options(name, api_key, api_url, &ProviderRuntimeOptions::default())
+}
+
+fn resolve_lmstudio_connection(api_url: Option<&str>, key: Option<&str>) -> (String, String) {
+    let base_url = api_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http://localhost:1234/v1")
+        .to_string();
+    let lm_studio_key = key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("lm-studio")
+        .to_string();
+    (base_url, lm_studio_key)
 }
 
 /// Factory: create provider with optional base URL and runtime options.
@@ -1200,14 +1217,11 @@ fn create_provider_with_url_and_options(
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "lmstudio" | "lm-studio" => {
-            let lm_studio_key = key
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("lm-studio");
+            let (base_url, lm_studio_key) = resolve_lmstudio_connection(api_url, key);
             Ok(Box::new(OpenAiCompatibleProvider::new(
                 "LM Studio",
-                "http://localhost:1234/v1",
-                Some(lm_studio_key),
+                &base_url,
+                Some(&lm_studio_key),
                 AuthStyle::Bearer,
             )))
         }
@@ -1246,6 +1260,18 @@ fn create_provider_with_url_and_options(
                 .unwrap_or("http://localhost:8000/v1");
             Ok(Box::new(OpenAiCompatibleProvider::new(
                 "vLLM",
+                base_url,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
+        "litellm" | "lite-llm" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(LITELLM_BASE_URL);
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "LiteLLM",
                 base_url,
                 key,
                 AuthStyle::Bearer,
@@ -1337,7 +1363,7 @@ fn create_provider_with_url_and_options(
 /// delimited profile, or `(original_str, None)` otherwise.  Entries starting
 /// with `custom:` or `anthropic-custom:` are left untouched because the colon
 /// is part of the URL scheme.
-fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
+pub(crate) fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
     if s.starts_with("custom:") || s.starts_with("anthropic-custom:") {
         return (s, None);
     }
@@ -1345,6 +1371,18 @@ fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
         Some((provider, profile)) if !profile.is_empty() => (provider, Some(profile)),
         _ => (s, None),
     }
+}
+
+fn resolve_fallback_api_key<'a>(
+    reliability: &'a crate::config::ReliabilityConfig,
+    fallback_entry: &str,
+    provider_name: &str,
+) -> Option<&'a str> {
+    reliability
+        .fallback_api_keys
+        .get(fallback_entry)
+        .or_else(|| reliability.fallback_api_keys.get(provider_name))
+        .map(String::as_str)
 }
 
 /// Create provider chain with retry and fallback behavior.
@@ -1388,15 +1426,18 @@ pub fn create_resilient_provider_with_options(
 
         let (provider_name, profile_override) = parse_provider_profile(fallback);
 
-        // Each fallback provider resolves its own credential via provider-
-        // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
-        // of inheriting the primary provider's key. Passing `None` lets
-        // `resolve_provider_credential` check the correct env var for the
-        // fallback provider name.
+        // Fallback providers can use explicit per-entry API keys from
+        // `reliability.fallback_api_keys` (keyed by full fallback entry), or
+        // fall back to provider-name keys for compatibility.
+        //
+        // If no explicit map entry exists, pass `None` so
+        // `resolve_provider_credential` can resolve provider-specific env vars.
         //
         // When a profile override is present (e.g. "openai-codex:second"),
         // propagate it through `auth_profile_override` so the provider
         // picks up the correct OAuth credential set.
+        let fallback_api_key = resolve_fallback_api_key(reliability, fallback, provider_name);
+
         let fallback_options = match profile_override {
             Some(profile) => {
                 let mut opts = options.clone();
@@ -1406,11 +1447,11 @@ pub fn create_resilient_provider_with_options(
             None => options.clone(),
         };
 
-        match create_provider_with_options(provider_name, None, &fallback_options) {
+        match create_provider_with_options(provider_name, fallback_api_key, &fallback_options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
-                    fallback_provider = fallback,
+                    fallback_provider = provider_name,
                     "Ignoring invalid fallback provider during initialization"
                 );
             }
@@ -1787,6 +1828,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "vllm",
             display_name: "vLLM",
             aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "litellm",
+            display_name: "LiteLLM",
+            aliases: &["lite-llm"],
             local: true,
         },
         ProviderInfo {
@@ -2324,6 +2371,37 @@ mod tests {
     }
 
     #[test]
+    fn lmstudio_connection_prefers_custom_base_url() {
+        let (base_url, key) =
+            resolve_lmstudio_connection(Some("http://10.0.0.15:1234/v1"), Some("custom-key"));
+        assert_eq!(base_url, "http://10.0.0.15:1234/v1");
+        assert_eq!(key, "custom-key");
+    }
+
+    #[test]
+    fn lmstudio_connection_uses_safe_defaults_when_unset() {
+        let (base_url, key) = resolve_lmstudio_connection(Some("   "), None);
+        assert_eq!(base_url, "http://localhost:1234/v1");
+        assert_eq!(key, "lm-studio");
+    }
+
+    #[test]
+    fn factory_lmstudio_with_custom_url() {
+        assert!(create_provider_with_url(
+            "lmstudio",
+            Some("key"),
+            Some("http://10.0.0.22:1234/v1")
+        )
+        .is_ok());
+        assert!(create_provider_with_url(
+            "lm-studio",
+            None,
+            Some("http://host.docker.internal:1234")
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn factory_llamacpp() {
         assert!(create_provider("llamacpp", Some("key")).is_ok());
         assert!(create_provider("llama.cpp", Some("key")).is_ok());
@@ -2340,6 +2418,25 @@ mod tests {
     fn factory_vllm() {
         assert!(create_provider("vllm", None).is_ok());
         assert!(create_provider("vllm", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_litellm() {
+        assert!(create_provider("litellm", None).is_ok());
+        assert!(create_provider("litellm", Some("key")).is_ok());
+        assert!(create_provider("lite-llm", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_litellm_custom_url() {
+        let options = ProviderRuntimeOptions::default();
+        let provider = create_provider_with_url_and_options(
+            "litellm",
+            Some("key"),
+            Some("https://litellm.example.com/v1"),
+            &options,
+        );
+        assert!(provider.is_ok());
     }
 
     #[test]
@@ -2378,6 +2475,18 @@ mod tests {
         let _guard = EnvGuard::set("OSAURUS_API_KEY", Some("osaurus-test-key"));
         let resolved = resolve_provider_credential("osaurus", None);
         assert_eq!(resolved, Some("osaurus-test-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_credential_uses_litellm_env_key() {
+        let _env_lock = env_lock();
+        let _litellm_guard = EnvGuard::set("LITELLM_API_KEY", Some("litellm-key"));
+
+        let resolved = resolve_provider_credential("litellm", None);
+        assert_eq!(resolved.as_deref(), Some("litellm-key"));
+
+        let alias_resolved = resolve_provider_credential("lite-llm", None);
+        assert_eq!(alias_resolved.as_deref(), Some("litellm-key"));
     }
 
     // ── Extended ecosystem ───────────────────────────────────
@@ -2591,6 +2700,7 @@ mod tests {
                 "openai".into(),
                 "openai".into(),
             ],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -2630,6 +2740,7 @@ mod tests {
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["lmstudio".into(), "ollama".into()],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -2652,6 +2763,7 @@ mod tests {
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -2678,6 +2790,7 @@ mod tests {
                 "nonexistent-provider".into(),
                 "lmstudio".into(),
             ],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -2710,6 +2823,7 @@ mod tests {
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -3081,6 +3195,39 @@ mod tests {
         assert_eq!(profile, Some("profile:extra"));
     }
 
+    #[test]
+    fn resolve_fallback_api_key_prefers_exact_entry_over_provider_name() {
+        let mut fallback_api_keys = std::collections::HashMap::new();
+        fallback_api_keys.insert(
+            "custom:https://one.example.com/v1".to_string(),
+            "entry-key".to_string(),
+        );
+        fallback_api_keys.insert("custom".to_string(), "provider-key".to_string());
+
+        let reliability = crate::config::ReliabilityConfig {
+            fallback_api_keys,
+            ..crate::config::ReliabilityConfig::default()
+        };
+
+        let resolved =
+            resolve_fallback_api_key(&reliability, "custom:https://one.example.com/v1", "custom");
+        assert_eq!(resolved, Some("entry-key"));
+    }
+
+    #[test]
+    fn resolve_fallback_api_key_uses_provider_name_as_compat_fallback() {
+        let mut fallback_api_keys = std::collections::HashMap::new();
+        fallback_api_keys.insert("openrouter".to_string(), "provider-key".to_string());
+
+        let reliability = crate::config::ReliabilityConfig {
+            fallback_api_keys,
+            ..crate::config::ReliabilityConfig::default()
+        };
+
+        let resolved = resolve_fallback_api_key(&reliability, "openrouter:secondary", "openrouter");
+        assert_eq!(resolved, Some("provider-key"));
+    }
+
     // --- resilient fallback with profile syntax ---
 
     #[test]
@@ -3091,6 +3238,7 @@ mod tests {
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["openai-codex:second".into()],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -3120,6 +3268,7 @@ mod tests {
                 "lmstudio".into(),
                 "nonexistent-provider".into(),
             ],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,

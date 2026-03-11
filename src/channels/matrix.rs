@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    media::{MediaFormat, MediaRequestParameters},
     ruma::{
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
@@ -10,12 +11,16 @@ use matrix_sdk::{
         events::Mentions,
         OwnedRoomId, OwnedUserId,
     },
+    store::{StateStoreDataKey, StateStoreDataValue},
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 
 /// Matrix channel for Matrix Client-Server API.
@@ -32,7 +37,9 @@ pub struct MatrixChannel {
     zeroclaw_dir: Option<PathBuf>,
     resolved_room_id_cache: Arc<RwLock<Option<String>>>,
     sdk_client: Arc<OnceCell<MatrixSdkClient>>,
+    otk_conflict_detected: Arc<AtomicBool>,
     http_client: Client,
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -41,6 +48,7 @@ impl std::fmt::Debug for MatrixChannel {
             .field("homeserver", &self.homeserver)
             .field("room_id", &self.room_id)
             .field("allowed_users", &self.allowed_users)
+            .field("transcription_enabled", &self.transcription.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -108,6 +116,56 @@ impl MatrixChannel {
         format!("{error_type} (details redacted)")
     }
 
+    fn is_otk_conflict_message(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("one time key") && lower.contains("already exists")
+    }
+
+    fn has_otk_conflict_state_marker(value: Option<StateStoreDataValue>) -> bool {
+        matches!(value, Some(StateStoreDataValue::OneTimeKeyAlreadyUploaded))
+    }
+
+    fn mark_otk_conflict_detected(flag: &AtomicBool, source: &str) {
+        let first_detection = !flag.swap(true, Ordering::SeqCst);
+        if first_detection {
+            tracing::error!(
+                "Matrix detected one-time key upload conflict via {source}; stopping listener to avoid retry loop."
+            );
+        }
+    }
+
+    async fn sync_otk_conflict_marker_from_store(client: &MatrixSdkClient, flag: &AtomicBool) {
+        match client
+            .state_store()
+            .get_kv_data(StateStoreDataKey::OneTimeKeyAlreadyUploaded)
+            .await
+        {
+            Ok(marker) => {
+                if Self::has_otk_conflict_state_marker(marker) {
+                    Self::mark_otk_conflict_detected(flag, "state-store marker");
+                }
+            }
+            Err(error) => {
+                let safe_error = Self::sanitize_error_for_log(&error);
+                tracing::warn!(
+                    "Matrix failed reading OTK conflict marker from state store: {safe_error}"
+                );
+            }
+        }
+    }
+
+    fn otk_conflict_recovery_message(&self) -> String {
+        let mut message = String::from(
+            "Matrix E2EE one-time key upload conflict detected (`one time key ... already exists`). \
+ZeroClaw paused Matrix sync to avoid an infinite retry loop. \
+Resolve by deregistering the stale Matrix device for this bot account, resetting the local Matrix crypto store, then restarting ZeroClaw.",
+        );
+        if let Some(store_dir) = self.matrix_store_dir() {
+            message.push_str(&format!(" Local crypto store: {}", store_dir.display()));
+        }
+        message
+    }
+
     fn normalize_optional_field(value: Option<String>) -> Option<String> {
         value
             .map(|entry| entry.trim().to_string())
@@ -171,8 +229,18 @@ impl MatrixChannel {
             zeroclaw_dir,
             resolved_room_id_cache: Arc::new(RwLock::new(None)),
             sdk_client: Arc::new(OnceCell::new()),
+            otk_conflict_detected: Arc::new(AtomicBool::new(false)),
             http_client: Client::new(),
+            transcription: None,
         }
+    }
+
+    /// Configure voice transcription.
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
+        self
     }
 
     pub fn with_mention_only(mut self, mention_only: bool) -> Self {
@@ -224,7 +292,7 @@ impl MatrixChannel {
     }
 
     fn is_supported_message_type(msgtype: &str) -> bool {
-        matches!(msgtype, "m.text" | "m.notice")
+        matches!(msgtype, "m.text" | "m.notice" | "m.audio")
     }
 
     fn has_non_empty_body(body: &str) -> bool {
@@ -513,6 +581,23 @@ impl MatrixChannel {
                 };
 
                 client.restore_session(session).await?;
+                let holder = client.cross_process_store_locks_holder_name().to_string();
+                if let Err(error) = client
+                    .encryption()
+                    .enable_cross_process_store_lock(holder)
+                    .await
+                {
+                    let safe_error = Self::sanitize_error_for_log(&error);
+                    tracing::warn!(
+                        "Matrix failed to enable cross-process crypto-store lock: {safe_error}"
+                    );
+                }
+
+                Self::sync_otk_conflict_marker_from_store(
+                    &client,
+                    self.otk_conflict_detected.as_ref(),
+                )
+                .await;
 
                 Ok::<MatrixSdkClient, anyhow::Error>(client)
             })
@@ -674,7 +759,14 @@ impl Channel for MatrixChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            anyhow::bail!("{}", self.otk_conflict_recovery_message());
+        }
+
         let client = self.matrix_client().await?;
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            anyhow::bail!("{}", self.otk_conflict_recovery_message());
+        }
         let target_room_id = self.target_room_id().await?;
         let target_room: OwnedRoomId = target_room_id.parse()?;
 
@@ -699,6 +791,10 @@ impl Channel for MatrixChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            anyhow::bail!("{}", self.otk_conflict_recovery_message());
+        }
+
         let target_room_id = self.target_room_id().await?;
         self.ensure_room_supported(&target_room_id).await?;
 
@@ -718,6 +814,9 @@ impl Channel for MatrixChannel {
             }
         };
         let client = self.matrix_client().await?;
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            anyhow::bail!("{}", self.otk_conflict_recovery_message());
+        }
 
         self.log_e2ee_diagnostics(&client).await;
 
@@ -745,6 +844,7 @@ impl Channel for MatrixChannel {
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
         let bot_dedupe_for_handler = Arc::clone(&recent_bot_event_cache);
         let mention_only_for_handler = self.mention_only;
+        let transcription_for_handler = self.transcription.clone();
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -753,6 +853,7 @@ impl Channel for MatrixChannel {
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
             let bot_dedupe = Arc::clone(&bot_dedupe_for_handler);
+            let transcription = transcription_for_handler.clone();
 
             async move {
                 if room.room_id().as_str() != target_room.as_str() {
@@ -776,6 +877,45 @@ impl Channel for MatrixChannel {
                 let body = match &event.content.msgtype {
                     MessageType::Text(content) => content.body.clone(),
                     MessageType::Notice(content) => content.body.clone(),
+                    MessageType::Audio(content) => {
+                        // Check if transcription is enabled
+                        if let Some(ref tc) = transcription {
+                            if tc.enabled {
+                                // 2. Media Acquisition
+                                // We use the room's client to fetch the actual media bytes.
+                                // This handles decryption automatically if the room is E2EE.
+                                let media_request = MediaRequestParameters {
+                                    source: content.source.clone(),
+                                    format: MediaFormat::File,
+                                };
+                                match room.client().media().get_media_content(&media_request, true).await {
+                                    Ok(audio_data) => {
+                                        // 3. Transcription via local service
+                                        match crate::channels::transcription::transcribe_audio(
+                                            audio_data,
+                                            &content.body,
+                                            tc,
+                                        ).await {
+                                            Ok(text) => text,
+                                            Err(e) => {
+                                                tracing::warn!("Matrix voice transcription failed: {e}");
+                                                format!("[Audio transcription failed: {}]", content.body)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let safe_error = MatrixChannel::sanitize_error_for_log(&e);
+                                        tracing::warn!("Failed to download Matrix audio: {safe_error}");
+                                        format!("[Audio download failed: {}]", content.body)
+                                    }
+                                }
+                            } else {
+                                return;
+                            }
+                        } else {
+                            return;
+                        }
+                    }
                     _ => return,
                 };
 
@@ -783,18 +923,18 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                let mut is_direct_room = false;
-                let mut is_mentioned = false;
-                let mut is_reply_to_bot = false;
-
                 if mention_only_for_handler {
-                    is_direct_room = room.is_direct().await.unwrap_or_else(|error| {
+                    let is_direct_room = room.is_direct().await.unwrap_or_else(|error| {
                         let safe_error = MatrixChannel::sanitize_error_for_log(&error);
                         tracing::warn!(
                             "Matrix is_direct() failed while evaluating mention_only gate: {safe_error}"
                         );
                         false
                     });
+
+                    let mut is_mentioned = false;
+                    let mut is_reply_to_bot = false;
+
                     if !is_direct_room {
                         is_mentioned =
                             MatrixChannel::event_mentions_user(&event, &body, my_user_id.as_str());
@@ -838,15 +978,37 @@ impl Channel for MatrixChannel {
         });
 
         let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(30));
+        let otk_conflict_detected = Arc::clone(&self.otk_conflict_detected);
+        let client_for_conflict_check = client.clone();
         client
             .sync_with_result_callback(sync_settings, |sync_result| {
                 let tx = tx.clone();
+                let otk_conflict_detected = Arc::clone(&otk_conflict_detected);
+                let client_for_conflict_check = client_for_conflict_check.clone();
                 async move {
                     if tx.is_closed() {
                         return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
                     }
 
+                    MatrixChannel::sync_otk_conflict_marker_from_store(
+                        &client_for_conflict_check,
+                        otk_conflict_detected.as_ref(),
+                    )
+                    .await;
+                    if otk_conflict_detected.load(Ordering::Relaxed) {
+                        return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
+                    }
+
                     if let Err(error) = sync_result {
+                        let raw_error = error.to_string();
+                        if MatrixChannel::is_otk_conflict_message(&raw_error) {
+                            MatrixChannel::mark_otk_conflict_detected(
+                                otk_conflict_detected.as_ref(),
+                                "sync error payload",
+                            );
+                            return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
+                        }
+
                         let safe_error = MatrixChannel::sanitize_error_for_log(&error);
                         tracing::warn!("Matrix sync error: {safe_error}, retrying...");
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -857,10 +1019,18 @@ impl Channel for MatrixChannel {
             })
             .await?;
 
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            anyhow::bail!("{}", self.otk_conflict_recovery_message());
+        }
+
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            return false;
+        }
+
         let Ok(room_id) = self.target_room_id().await else {
             return false;
         };
@@ -869,14 +1039,17 @@ impl Channel for MatrixChannel {
             return false;
         }
 
-        self.matrix_client().await.is_ok()
+        if self.matrix_client().await.is_err() {
+            return false;
+        }
+
+        !self.otk_conflict_detected.load(Ordering::Relaxed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::ruma::{OwnedEventId, OwnedUserId};
 
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(
@@ -1003,6 +1176,41 @@ mod tests {
     }
 
     #[test]
+    fn otk_conflict_message_detection_matches_matrix_errors() {
+        assert!(MatrixChannel::is_otk_conflict_message(
+            "One time key signed_curve25519:AAAAAAAAAA4 already exists. Old key: ... new key: ..."
+        ));
+        assert!(!MatrixChannel::is_otk_conflict_message(
+            "Matrix sync timeout while waiting for long poll"
+        ));
+    }
+
+    #[test]
+    fn otk_conflict_state_marker_detection_matches_store_values() {
+        assert!(MatrixChannel::has_otk_conflict_state_marker(Some(
+            StateStoreDataValue::OneTimeKeyAlreadyUploaded
+        )));
+        assert!(!MatrixChannel::has_otk_conflict_state_marker(None));
+    }
+
+    #[test]
+    fn otk_conflict_recovery_message_includes_store_path_when_available() {
+        let ch = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+            "https://matrix.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            None,
+            None,
+            Some(PathBuf::from("/tmp/zeroclaw")),
+        );
+
+        let message = ch.otk_conflict_recovery_message();
+        assert!(message.contains("one-time key upload conflict"));
+        assert!(message.contains("/tmp/zeroclaw/state/matrix"));
+    }
+
+    #[test]
     fn encode_path_segment_encodes_room_refs() {
         assert_eq!(
             MatrixChannel::encode_path_segment("#ops:matrix.example.com"),
@@ -1018,8 +1226,27 @@ mod tests {
     fn supported_message_type_detection() {
         assert!(MatrixChannel::is_supported_message_type("m.text"));
         assert!(MatrixChannel::is_supported_message_type("m.notice"));
+        assert!(MatrixChannel::is_supported_message_type("m.audio"));
         assert!(!MatrixChannel::is_supported_message_type("m.image"));
         assert!(!MatrixChannel::is_supported_message_type("m.file"));
+    }
+
+    #[test]
+    fn with_transcription_configures_enabled_config() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription.is_some());
+    }
+
+    #[test]
+    fn with_transcription_ignores_disabled_config() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = false;
+
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription.is_none());
     }
 
     #[test]

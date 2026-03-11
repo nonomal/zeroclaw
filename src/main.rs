@@ -86,6 +86,7 @@ mod tools;
 mod tunnel;
 mod update;
 mod util;
+mod workspace;
 
 use config::Config;
 
@@ -349,6 +350,22 @@ Examples:
         tools: Vec<String>,
     },
 
+    /// Manage security maintenance tasks
+    #[command(long_about = "\
+Manage security maintenance tasks.
+
+Commands in this group maintain security-related data stores used at runtime.
+
+Examples:
+  zeroclaw security update-guard-corpus
+  zeroclaw security update-guard-corpus --source builtin
+  zeroclaw security update-guard-corpus --source ./data/security/attack-corpus-v1.jsonl
+  zeroclaw security update-guard-corpus --source https://example.com/guard-corpus.jsonl --checksum <sha256>")]
+    Security {
+        #[command(subcommand)]
+        security_command: SecurityCommands,
+    },
+
     /// Configure and manage scheduled tasks
     #[command(long_about = "\
 Configure and manage scheduled tasks.
@@ -497,6 +514,24 @@ Examples:
         config_command: ConfigCommands,
     },
 
+    /// Manage in-process workspace registry entries
+    #[command(long_about = "\
+Manage workspace registry entries for multi-workspace deployments.
+
+The workspace registry is opt-in and controlled by `[workspaces].enabled = true`
+in your config.toml. Commands operate on the local filesystem registry root.
+
+Examples:
+  zeroclaw workspace create --name team-a
+  zeroclaw workspace list
+  zeroclaw workspace disable <workspace-id>
+  zeroclaw workspace token rotate <workspace-id>
+  zeroclaw workspace delete <workspace-id> --confirm")]
+    Workspace {
+        #[command(subcommand)]
+        workspace_command: WorkspaceCommands,
+    },
+
     /// Generate shell completion script to stdout
     #[command(long_about = "\
 Generate shell completion scripts for `zeroclaw`.
@@ -521,6 +556,45 @@ enum ConfigCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum WorkspaceCommands {
+    /// Create a workspace and print its bearer token once
+    Create {
+        /// Optional display name shown in `workspace list`
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List registered workspaces
+    List,
+    /// Disable an existing workspace (data preserved)
+    Disable {
+        /// Workspace UUID
+        workspace_id: String,
+    },
+    /// Delete workspace data recursively (requires --confirm)
+    Delete {
+        /// Workspace UUID
+        workspace_id: String,
+        /// Acknowledge destructive deletion
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Manage workspace bearer tokens
+    Token {
+        #[command(subcommand)]
+        token_command: WorkspaceTokenCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceTokenCommands {
+    /// Rotate bearer token for a workspace and print new token once
+    Rotate {
+        /// Workspace UUID
+        workspace_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum EstopSubcommands {
     /// Print current estop status.
     Status,
@@ -538,6 +612,19 @@ enum EstopSubcommands {
         /// OTP code. If omitted and OTP is required, a prompt is shown.
         #[arg(long)]
         otp: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SecurityCommands {
+    /// Upsert semantic prompt-injection corpus records into the configured vector collection
+    UpdateGuardCorpus {
+        /// Corpus source: `builtin`, filesystem path, or HTTP(S) URL
+        #[arg(long)]
+        source: Option<String>,
+        /// Expected SHA-256 checksum (hex) for source payload verification
+        #[arg(long)]
+        checksum: Option<String>,
     },
 }
 
@@ -785,17 +872,17 @@ async fn main() -> Result<()> {
             bail!("--channels-only does not accept --force");
         }
         let config = if channels_only {
-            onboard::run_channels_repair_wizard().await
+            Box::pin(onboard::run_channels_repair_wizard()).await
         } else if interactive {
-            onboard::run_wizard(force).await
+            Box::pin(onboard::run_wizard(force)).await
         } else {
-            onboard::run_quick_setup(
+            Box::pin(onboard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
                 force,
-            )
+            ))
             .await
         }?;
         // Auto-start channels if user said yes during wizard
@@ -857,7 +944,7 @@ async fn main() -> Result<()> {
             if let Some(ref backend) = memory_backend {
                 config.memory.backend = backend.clone();
             }
-            agent::run(
+            Box::pin(agent::run(
                 config,
                 message,
                 provider,
@@ -865,7 +952,7 @@ async fn main() -> Result<()> {
                 temperature,
                 peripheral,
                 true,
-            )
+            ))
             .await
             .map(|_| ())
         }
@@ -1010,6 +1097,10 @@ async fn main() -> Result<()> {
             tools,
         } => handle_estop_command(&config, estop_command, level, domains, tools),
 
+        Commands::Security { security_command } => {
+            handle_security_command(&config, security_command).await
+        }
+
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => match model_command {
@@ -1132,6 +1223,90 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
+                Ok(())
+            }
+        },
+
+        Commands::Workspace { workspace_command } => {
+            handle_workspace_command(workspace_command, &config)
+        }
+    }
+}
+
+fn handle_workspace_command(workspace_command: WorkspaceCommands, config: &Config) -> Result<()> {
+    if !config.workspaces.enabled {
+        bail!(
+            "workspace registry is disabled. Enable [workspaces].enabled = true in {}",
+            config.config_path.display()
+        );
+    }
+
+    let root = workspace::registry_root_from_config(config)?;
+    let mut registry = workspace::WorkspaceRegistry::load(&root)?;
+
+    match workspace_command {
+        WorkspaceCommands::Create { name } => {
+            let display_name = name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("workspace-{}", uuid::Uuid::new_v4()));
+            let (workspace_id, token) = registry.create(&display_name)?;
+            println!("Workspace created.");
+            println!("  id: {workspace_id}");
+            println!("  display_name: {display_name}");
+            println!("  root: {}", registry.root().display());
+            println!("  token: {token}");
+            println!("Store this token securely; it is shown only once.");
+            Ok(())
+        }
+        WorkspaceCommands::List => {
+            let workspaces = registry.list();
+            if workspaces.is_empty() {
+                println!("No workspaces found under {}", registry.root().display());
+                return Ok(());
+            }
+
+            println!("Workspace root: {}", registry.root().display());
+            println!(
+                "{:<36}  {:<7}  {:<20}  {}",
+                "ID", "ENABLED", "CREATED_AT", "DISPLAY_NAME"
+            );
+            for workspace in workspaces {
+                println!(
+                    "{:<36}  {:<7}  {:<20}  {}",
+                    workspace.id, workspace.enabled, workspace.created_at, workspace.display_name
+                );
+            }
+            Ok(())
+        }
+        WorkspaceCommands::Disable { workspace_id } => {
+            registry.disable(&workspace_id)?;
+            println!("Workspace disabled: {workspace_id}");
+            Ok(())
+        }
+        WorkspaceCommands::Delete {
+            workspace_id,
+            confirm,
+        } => {
+            if !confirm {
+                bail!(
+                    "workspace delete is destructive. Re-run with --confirm to delete {}",
+                    workspace_id
+                );
+            }
+            registry.delete(&workspace_id)?;
+            println!("Workspace deleted: {workspace_id}");
+            Ok(())
+        }
+        WorkspaceCommands::Token { token_command } => match token_command {
+            WorkspaceTokenCommands::Rotate { workspace_id } => {
+                let token = registry.rotate_token(&workspace_id)?;
+                println!("Workspace token rotated.");
+                println!("  id: {workspace_id}");
+                println!("  token: {token}");
+                println!("Store this token securely; it is shown only once.");
                 Ok(())
             }
         },
@@ -1323,6 +1498,30 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
 
     writer.flush()?;
     Ok(())
+}
+
+async fn handle_security_command(
+    config: &Config,
+    security_command: SecurityCommands,
+) -> Result<()> {
+    match security_command {
+        SecurityCommands::UpdateGuardCorpus { source, checksum } => {
+            let report = security::semantic_guard::update_guard_corpus(
+                config,
+                source.as_deref(),
+                checksum.as_deref(),
+            )
+            .await?;
+
+            println!("Semantic guard corpus update completed.");
+            println!("  Source:           {}", report.source);
+            println!("  SHA-256:          {}", report.sha256);
+            println!("  Parsed records:   {}", report.parsed_records);
+            println!("  Upserted records: {}", report.upserted_records);
+            println!("  Collection:       {}", report.collection);
+            Ok(())
+        }
+    }
 }
 
 // ─── Generic Pending OAuth Login ────────────────────────────────────────────
@@ -2111,6 +2310,67 @@ mod tests {
                 ..
             } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
             other => panic!("expected estop resume command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_cli_parses_create_with_name() {
+        let cli = Cli::try_parse_from(["zeroclaw", "workspace", "create", "--name", "team-a"])
+            .expect("workspace create should parse");
+
+        match cli.command {
+            Commands::Workspace {
+                workspace_command: WorkspaceCommands::Create { name },
+            } => assert_eq!(name.as_deref(), Some("team-a")),
+            other => panic!("expected workspace create command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_cli_parses_token_rotate() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "workspace",
+            "token",
+            "rotate",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ])
+        .expect("workspace token rotate should parse");
+
+        match cli.command {
+            Commands::Workspace {
+                workspace_command:
+                    WorkspaceCommands::Token {
+                        token_command: WorkspaceTokenCommands::Rotate { workspace_id },
+                    },
+            } => assert_eq!(workspace_id, "550e8400-e29b-41d4-a716-446655440000"),
+            other => panic!("expected workspace token rotate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_cli_delete_requires_explicit_confirm_flag_value() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "workspace",
+            "delete",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--confirm",
+        ])
+        .expect("workspace delete should parse");
+
+        match cli.command {
+            Commands::Workspace {
+                workspace_command:
+                    WorkspaceCommands::Delete {
+                        workspace_id,
+                        confirm,
+                    },
+            } => {
+                assert_eq!(workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+                assert!(confirm);
+            }
+            other => panic!("expected workspace delete command, got {other:?}"),
         }
     }
 }
